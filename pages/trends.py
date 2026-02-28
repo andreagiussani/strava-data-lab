@@ -5,6 +5,7 @@ truststore.inject_into_ssl()
 import os
 from datetime import datetime, timezone
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 from dateutil.relativedelta import relativedelta
@@ -14,22 +15,42 @@ from strava_client import load_activities
 
 load_dotenv()
 
-TZ = "Europe/Zurich"
+TZ = os.getenv("STRAVA_TZ", "Europe/Zurich")
 
 
 def normalize_type(t: str) -> str:
-    """
-    Stravalib sometimes returns strings like "root='Run'".
-    Normalize to a clean label like "Run".
-    """
+    """Stravalib sometimes returns strings like root='Run'. Normalize -> Run."""
     t = str(t)
     if "root=" in t and "'" in t:
-        # root='Run' -> Run
         try:
             return t.split("'")[1]
         except Exception:
             return t
     return t
+
+
+def _get_start_local(df: pd.DataFrame, tz: str) -> pd.Series:
+    """
+    Prefer Strava local timestamp if available (matches Strava UI bucketing).
+    Fallback to converting UTC start_date to tz.
+    """
+    if "start_date_local" in df.columns:
+        s = pd.to_datetime(df["start_date_local"])
+        # ensure tz-aware
+        if getattr(s.dt, "tz", None) is None:
+            s = s.dt.tz_localize(tz)
+        else:
+            s = s.dt.tz_convert(tz)
+        return s
+
+    # fallback
+    st.warning(
+        "⚠️ `start_date_local` not found in the dataframe. "
+        "Monthly/weekly bucketing will use `start_date` converted to local TZ. "
+        "If you travel across timezones, some activities can be bucketed into the wrong month/week. "
+        "Fix: update `strava_client.load_activities` to always return `start_date_local`."
+    )
+    return pd.to_datetime(df["start_date"], utc=True).dt.tz_convert(tz)
 
 
 def weekly_monthly_km_by_sport(
@@ -39,16 +60,21 @@ def weekly_monthly_km_by_sport(
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     # only activities with distance > 0 (exclude WeightTraining etc.)
     d = df[df["distance_km"] > 0].copy()
+    if d.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
     d["sport"] = d["type"].astype(str).map(normalize_type)
 
     if sports:
-        d = d[d["sport"].isin(sports)]
+        d = d[d["sport"].isin(sports)].copy()
 
-    # local timezone to avoid midnight edge cases
-    d["start_local"] = d["start_date"].dt.tz_convert(tz)
+    if d.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    d["start_local"] = _get_start_local(d, tz)
     d = d.set_index("start_local")
 
-    # ---- WEEKLY: Mon->Sun, label on Monday, bucket [Mon, next Mon) ----
+    # ---- WEEKLY: Mon->Sun, bucket [Mon, next Mon), label on Monday ----
     wk = (
         d.groupby(["sport", pd.Grouper(freq="W-MON", label="left", closed="left")])["distance_km"]
         .sum()
@@ -57,10 +83,9 @@ def weekly_monthly_km_by_sport(
     )
     wk.index.name = "week_start"
 
-    # complete weekly index => continuous lines
     if len(wk.index) > 0:
-        wk_full_idx = pd.date_range(wk.index.min(), wk.index.max(), freq="W-MON", tz=wk.index.tz)
-        wk = wk.reindex(wk_full_idx)
+        wk_full = pd.date_range(wk.index.min(), wk.index.max(), freq="W-MON", tz=wk.index.tz)
+        wk = wk.reindex(wk_full)
 
     # ---- MONTHLY: month start ----
     mo = (
@@ -71,16 +96,80 @@ def weekly_monthly_km_by_sport(
     )
     mo.index.name = "month_start"
 
-    # complete monthly index => continuous lines
     if len(mo.index) > 0:
-        mo_full_idx = pd.date_range(mo.index.min(), mo.index.max(), freq="MS", tz=mo.index.tz)
-        mo = mo.reindex(mo_full_idx)
+        mo_full = pd.date_range(mo.index.min(), mo.index.max(), freq="MS", tz=mo.index.tz)
+        mo = mo.reindex(mo_full)
 
-    # continuous lines: missing periods -> 0
+    # continuous lines/bars: missing periods -> 0
     wk = wk.fillna(0).round(2)
     mo = mo.fillna(0).round(2)
 
     return wk, mo
+
+
+def monthly_bar_with_line(mo_df: pd.DataFrame) -> alt.Chart:
+    """
+    Bar chart for monthly km.
+    - If 1 sport: bars + line overlay (same values; NOT rolling)
+    - If multiple sports: stacked bars
+    """
+    if mo_df is None or mo_df.empty:
+        return alt.Chart(pd.DataFrame({"month_start": [], "sport": [], "km_month": []}))
+
+    base = mo_df.copy().reset_index()
+
+    # the first column after reset_index is the old index (month start)
+    idx_col = base.columns[0]
+    base = base.rename(columns={idx_col: "month_start"})
+
+    long = base.melt(id_vars=["month_start"], var_name="sport", value_name="km_month")
+    long["month_label"] = pd.to_datetime(long["month_start"]).dt.strftime("%b %Y")
+
+    sports = [c for c in mo_df.columns.tolist() if c is not None]
+
+    if len(sports) <= 1:
+        bar = (
+            alt.Chart(long)
+            .mark_bar()
+            .encode(
+                x=alt.X("month_start:T", title="", axis=alt.Axis(format="%b %Y", labelAngle=0)),
+                y=alt.Y("km_month:Q", title="km"),
+                tooltip=[
+                    alt.Tooltip("month_label:N", title="Month"),
+                    alt.Tooltip("km_month:Q", title="km", format=".2f"),
+                ],
+            )
+        )
+        # line = (
+        #     alt.Chart(long)
+        #     .mark_line(point=True)
+        #     .encode(
+        #         x=alt.X("month_start:T"),
+        #         y=alt.Y("km_month:Q"),
+        #         tooltip=[
+        #             alt.Tooltip("month_label:N", title="Month"),
+        #             alt.Tooltip("km_month:Q", title="km", format=".2f"),
+        #         ],
+        #     )
+        # )
+        return (bar).properties(height=260)
+
+    # multiple sports -> stacked bars
+    return (
+        alt.Chart(long)
+        .mark_bar()
+        .encode(
+            x=alt.X("month_start:T", title="", axis=alt.Axis(format="%b %Y", labelAngle=0)),
+            y=alt.Y("sum(km_month):Q", title="km"),
+            color=alt.Color("sport:N", title="Sport"),
+            tooltip=[
+                alt.Tooltip("month_label:N", title="Month"),
+                alt.Tooltip("sport:N", title="Sport"),
+                alt.Tooltip("km_month:Q", title="km", format=".2f"),
+            ],
+        )
+        .properties(height=260)
+    )
 
 
 # ----------------------------
@@ -106,14 +195,12 @@ if df.empty:
     st.info("No activities found in this period.")
     st.stop()
 
-# Available sports (normalized)
 df["sport"] = df["type"].astype(str).map(normalize_type)
 available_sports = sorted(df["sport"].dropna().unique().tolist())
 
-# Default: Run only if present, else first available
 default_sports = ["Run"] if "Run" in available_sports else (available_sports[:1] if available_sports else [])
-
 sports = st.sidebar.multiselect("Sport", available_sports, default=default_sports)
+
 if not sports:
     st.warning("Select at least one sport.")
     st.stop()
@@ -127,8 +214,8 @@ if wk_df.empty and mo_df.empty:
 st.subheader("Weekly distance (km)")
 st.line_chart(wk_df)
 
-st.subheader("Monthly distance (km)")
-st.line_chart(mo_df)
+st.subheader("Monthly distance (km) — bars + line")
+st.altair_chart(monthly_bar_with_line(mo_df), use_container_width=True)
 
 st.subheader("Tables")
 c1, c2 = st.columns(2)
